@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 
-use Test; BEGIN { plan tests => 201 };
+use Test; BEGIN { plan tests => 701 };
 
 use lib '../lib'; if (-d 't') { chdir 't'; }
 use IPC::DirQueue;
@@ -29,6 +29,16 @@ sub start_worker {
     if (!$job) { next; }
 
     ok ($job->get_data_path());
+    ok (open (IN, "<".$job->get_data_path()));
+    my $str = <IN>;
+    ok (close IN);
+
+    ok ($str =~ /^hello world! \d+$/)   
+        or warn "got: [$str]";
+
+    ok ($job->{metadata}->{foo});
+    ok ($job->{metadata}->{foo} =~ /^bar \d+$/)
+        or warn "got: [$job->{metadata}->{foo}]";
 
     $job->finish();
     $k++;

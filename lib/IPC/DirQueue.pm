@@ -66,7 +66,7 @@ use IPC::DirQueue::Job;
 
 our @ISA = ();
 
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 ###########################################################################
 
@@ -190,7 +190,7 @@ sub enqueue_string {
 
 # private implementation.
 sub enqueue_backend {
-  my ($self, $metadata, $pri, $fhin, $stringin) = @_;
+  my ($self, $metadata, $pri, $fhin, $callbackin) = @_;
 
   if (!defined($pri)) { $pri = 50; }
   if ($pri < 0 || $pri > 99) {
@@ -224,7 +224,7 @@ sub enqueue_backend {
   }
   my $pathtmpdata_created = 1;
 
-  my $siz = $self->copy_in_to_out_fh ($fhin, $stringin,
+  my $siz = $self->copy_in_to_out_fh ($fhin, $callbackin,
                               \*OUT, $pathtmpdata);
   if (!defined $siz) {
     goto failure;
@@ -583,14 +583,15 @@ sub get_dir_filelist_sorted {
 }
 
 sub copy_in_to_out_fh {
-  my ($self, $fhin, $stringin, $fhout, $outfname) = @_;
+  my ($self, $fhin, $callbackin, $fhout, $outfname) = @_;
 
   my $buf;
   my $len;
   my $siz = 0;
 
   binmode $fhout;
-  if ($stringin) {
+  if ($callbackin) {
+    my $stringin = $callbackin->();
     $len = length ($stringin);
     if (!syswrite ($fhout, $stringin, $len)) {
       warn "IPC::DirQueue: cannot write to $outfname: $!";
@@ -755,6 +756,9 @@ sub read_control_file {
 
 sub worker_still_working {
   my ($self, $fname);
+  if (!$fname) {
+    return;
+  }
   if (!open (IN, "<".$fname)) {
     return;
   }
