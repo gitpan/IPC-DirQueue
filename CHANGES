@@ -1,0 +1,42 @@
+------------------------------------------------------------------------
+r662 | jmason | 2005-01-12 18:26:40 -0800 (Wed, 12 Jan 2005) | 1 line
+
+add note about mailing list
+------------------------------------------------------------------------
+r661 | jmason | 2005-01-12 18:22:44 -0800 (Wed, 12 Jan 2005) | 2 lines
+
+bug: dqserver should run forever when --njobs is 0, or unset; instead, it was exiting immediately.  Patch from Jeffrey Wescott <jeff . binaryfeed . org>.
+
+------------------------------------------------------------------------
+r461 | jmason | 2004-09-17 04:06:57 -0700 (Fri, 17 Sep 2004) | 1 line
+
+added debugging; also, tracked down a mysterious condition that resulted in unused files being left in the active dir.
+------------------------------------------------------------------------
+r460 | jmason | 2004-09-17 04:05:35 -0700 (Fri, 17 Sep 2004) | 1 line
+
+MANIFEST fixes
+------------------------------------------------------------------------
+r453 | jmason | 2004-09-09 18:14:30 -0700 (Thu, 09 Sep 2004) | 1 line
+
+updated documentation on the directory structure used; readying release
+------------------------------------------------------------------------
+r449 | jmason | 2004-08-30 14:26:49 -0700 (Mon, 30 Aug 2004) | 1 line
+
+bump version to 0.03
+------------------------------------------------------------------------
+r448 | jmason | 2004-08-26 21:22:07 -0700 (Thu, 26 Aug 2004) | 1 line
+
+now up to the latest. added hashing of the data dir; long tests to measure speed effects of code changes; filenames are now significantly shortened using a hash instead of the raw string for the (hostname,pid) part
+------------------------------------------------------------------------
+r447 | jmason | 2004-08-26 21:19:25 -0700 (Thu, 26 Aug 2004) | 1 line
+
+version 0.02, for the record
+------------------------------------------------------------------------
+r446 | jmason | 2004-08-26 21:18:41 -0700 (Thu, 26 Aug 2004) | 1 line
+
+version 0.01, for the record
+------------------------------------------------------------------------
+r445 | robert | 2004-08-26 20:11:46 -0700 (Thu, 26 Aug 2004) | 1 line
+
+[perl #31356] new svn for IPC::DirQueue
+------------------------------------------------------------------------
