@@ -46,10 +46,10 @@ new ones. Since there's no 'socket' or similar point of failure aside from
 the directory itself, the queue will just quietly fill with waiting jobs
 until the new dequeuer is ready.
 
-Arbitrary 'name = value' metadata pairs can be transferred alongside data
+Arbitrary 'name = value' string-pair metadata can be transferred alongside data
 files.   In fact, in some cases, you may find it easier to send unused and
-empty data files, and just use the 'metadata' fields to transfer the
-details of what will be worked on.
+empty data files, and just use the 'metadata' fields to transfer the details of
+what will be worked on.
 
 =head1 METHODS
 
@@ -66,13 +66,15 @@ use IPC::DirQueue::Job;
 
 our @ISA = ();
 
-our $VERSION = 0.02;
+our $VERSION = 0.03;
+
+use constant SLASH => '/';
 
 ###########################################################################
 
 =item $dq->new ($opts);
 
-Create a new batch-queue object, suitable for either enqueueing jobs
+Create a new queue object, suitable for either enqueueing jobs
 or picking up already-queued jobs for processing.
 
 C<$opts> is a reference to a hash, which may contain the following
@@ -96,6 +98,15 @@ The C<chmod>-style file mode for queue control files.  This should be
 specified as a string with a leading 0.  It will be affected by the
 current process C<umask>.
 
+=item ordered => { 0 | 1 } (default: 1)
+
+Whether the jobs should be processed in order of submission, or
+in no particular order.
+
+=item buf_size => $number (default: 65536)
+
+The buffer size to use when copying files, in bytes.
+
 =back
 
 =cut
@@ -114,6 +125,15 @@ sub new {
   $self->{queue_file_mode} ||= '0666';
   $self->{queue_file_mode} = oct ($self->{queue_file_mode});
 
+  if (!defined $self->{ordered}) {
+    $self->{ordered} = 1;
+  }
+
+  $self->{buf_size} ||= 65536;
+
+  $self->{ensured_dir_exists} = { };
+  $self->ensure_dir_exists ($self->{dir});
+
   $self;
 }
 
@@ -126,23 +146,25 @@ C<undef> on failure.
 
 C<$metadata> is an optional hash reference; every item of metadata will be
 available to worker processes on the C<IPC::DirQueue::Job> object, in the
-C<$job->{metadata}> hashref.  Note that using this channel for metadata
+C<$job-E<gt>{metadata}> hashref.  Note that using this channel for metadata
 brings with it several restrictions:
 
-1. it requires that the metadata be stored as 'name' => 'value' string
-pairs
+=over 4
 
-2. neither 'name' nor 'value' may contain newline (\r) or NUL (\0)
-characters
+=item 1. it requires that the metadata be stored as 'name' => 'value' string pairs
 
-3. 'name' cannot contain colon characters
+=item 2. neither 'name' nor 'value' may contain newline (\r) or NUL (\0) characters
 
-4. 'name' cannot start with a capital 'Q' and be 4 characters in length
+=item 3. 'name' cannot contain colon characters
+
+=item 4. 'name' cannot start with a capital 'Q' and be 4 characters in length
+
+=back
 
 If those restrictions are broken, that metadatum will be silently dropped.
 
 An optional priority can be specified; lower priorities are run first.
-Priorities range from 0 to 100, and 50 is default.
+Priorities range from 0 to 99, and 50 is default.
 
 =cut
 
@@ -161,7 +183,7 @@ sub enqueue_file {
 
 Enqueue a new job for processing. Returns C<1> if the job was enqueued, or
 C<undef> on failure. C<$pri> and C<$metadata> are as described in
-C<$dq->enqueue_file()>.
+C<$dq-E<gt>enqueue_file()>.
 
 =cut
 
@@ -176,7 +198,7 @@ sub enqueue_fh {
 
 Enqueue a new job for processing.  The job data is entirely read from
 C<$string>. Returns C<1> if the job was enqueued, or C<undef> on failure.
-C<$pri> and C<$metadata> are as described in C<$dq->enqueue_file()>.
+C<$pri> and C<$metadata> are as described in C<$dq-E<gt>enqueue_file()>.
 
 =cut
 
@@ -210,11 +232,13 @@ sub enqueue_backend {
   # NOTE: this can change until the moment we've renamed the ctrl file
   # into 'queue'!
   my $qfnametmp = $self->new_q_filename($job);
+  my $qcnametmp = $qfnametmp;
 
   my $pathtmp = $self->q_subdir('tmp');
-  (-d $pathtmp) or mkdir($pathtmp);
-  my $pathtmpctrl = $self->catfile ($pathtmp, $qfnametmp.".ctrl");
-  my $pathtmpdata = $self->catfile ($pathtmp, $qfnametmp.".data");
+  $self->ensure_dir_exists ($pathtmp);
+
+  my $pathtmpctrl = $pathtmp.SLASH.$qfnametmp.".ctrl";
+  my $pathtmpdata = $pathtmp.SLASH.$qfnametmp.".data";
 
   if (!sysopen (OUT, $pathtmpdata, O_WRONLY|O_CREAT|O_EXCL,
       $self->{data_file_mode}))
@@ -231,8 +255,33 @@ sub enqueue_backend {
   }
   $job->{size_bytes} = $siz;
 
-  # now link(2) that into the 'data' dir.
+  # get the data dir
   my $pathdatadir = $self->q_subdir('data');
+
+  # hashing the data dir, using 2 levels of directory hashing.  This has a tiny
+  # effect on speed in all cases up to 10k queued files, but has good results
+  # in terms of the usability of those dirs for users doing direct access, so
+  # enabled by default.
+  if (1) {
+    # take the last two chars for the hashname.  In most cases, this will
+    # be the last 2 chars of a hash of (hostname, pid), so effectively
+    # random.  Remove it from the filename entirely, since it's redundant
+    # to have it both in the dir name and the filename.
+    $qfnametmp =~ s/([A-Za-z0-9+_])([A-Za-z0-9+_])$//;
+    my $hash1 = $1 || '0';
+    my $hash2 = $2 || '0';
+    my $origdatadir = $pathdatadir;
+    $pathdatadir = "$pathdatadir/$hash1/$hash2";
+    # check to see if that hashdir exists... build it up if req'd
+    if (!-d $pathdatadir) {
+      foreach my $dir ($origdatadir, "$origdatadir/$hash1", $pathdatadir)
+      {
+        (-d $dir) or mkdir ($dir);
+      }
+    }
+  }
+
+  # now link(2) the data tmpfile into the 'data' dir.
   my $pathdata = $self->link_into_dir ($job, $pathtmpdata,
                                     $pathdatadir, $qfnametmp);
   if (!$pathdata) {
@@ -251,7 +300,7 @@ sub enqueue_backend {
   # now link(2) that into the 'queue' dir.
   my $pathqueuedir = $self->q_subdir('queue');
   my $pathqueue = $self->link_into_dir ($job, $pathtmpctrl,
-                                    $pathqueuedir, $qfnametmp);
+                                    $pathqueuedir, $qcnametmp);
   if (!$pathqueue) {
     goto failure;
   }
@@ -283,7 +332,7 @@ empty or because other worker processes are already working on
 them, C<undef> is returned; otherwise, a new instance of C<IPC::DirQueue::Job>
 is returned.
 
-Note that the job is marked as I<active> until C<$job->finish()>
+Note that the job is marked as I<active> until C<$job-E<gt>finish()>
 is called.
 
 =cut
@@ -293,23 +342,49 @@ sub pickup_queued_job {
 
   my $pathqueuedir = $self->q_subdir('queue');
   my $pathactivedir = $self->q_subdir('active');
-  (-d $pathactivedir) or mkdir($pathactivedir);
+  $self->ensure_dir_exists ($pathactivedir);
 
-  my @files = $self->get_dir_filelist_sorted($pathqueuedir);
+  my $ordered = $self->{ordered};
+  my @files;
+  my $dirfh;
+
+  if ($ordered) {
+    @files = $self->get_dir_filelist_sorted($pathqueuedir);
+    if (scalar @files <= 0) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+    }
+  } else {
+    if (!opendir ($dirfh, $pathqueuedir)) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+      if (!opendir ($dirfh, $pathqueuedir)) {
+        warn "oops? pathqueuedir bad"; return;
+      }
+    }
+  }
+
+  my $nextfile;
   while (1) {
-    my $nextfile = shift @files;
-    if (!$nextfile) {
-      # no more files in the queue, return empty
-      return;
+    my $pathtmpactive;
+
+    if ($ordered) {
+      $nextfile = shift @files;
+    } else {
+      $nextfile = readdir($dirfh);
     }
 
-    my $pathactive = $self->catfile ($pathactivedir, $nextfile);
+    if (!$nextfile) {
+      # no more files in the queue, return empty
+      last;
+    }
+
+    next if ($nextfile !~ /^\d/);
+    my $pathactive = $pathactivedir.SLASH.$nextfile;
 
     my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
         $atime,$mtime,$ctime,$blksize,$blocks) = lstat($pathactive);
 
     if (defined $mtime) {
-      # call time() here.  In extremely large dirs, it may take
+      # *DO* call time() here.  In extremely large dirs, it may take
       # several seconds to traverse the entire listing from start
       # to finish!
       if (time() - $mtime < 600) {
@@ -325,8 +400,8 @@ sub pickup_queued_job {
       # now, we want to try to avoid 2 or 3 dequeuers removing
       # the lockfile simultaneously, as that could cause this race:
       #
-      # dqproc1: [checksfile]    [unlinks] [startswork]
-      # dqproc2:        [checksfile]                    [unlinks]
+      # dqproc1: [checks file]        [unlinks] [starts work]
+      # dqproc2:        [checks file]                         [unlinks]
       #
       # ie. the second process unlinks the first process' brand-new
       # lockfile!
@@ -350,11 +425,11 @@ sub pickup_queued_job {
 
     # ok, we're free to get cracking on this file.
     my $pathtmp = $self->q_subdir('tmp');
-    (-d $pathtmp) or mkdir($pathtmp);
+    $self->ensure_dir_exists ($pathtmp);
 
     # use the name of the queue file itself, plus a tmp prefix, plus active
-    my $pathtmpactive = $self->catfile ($pathtmp,
-                $nextfile.".".$self->new_lock_filename().".active");
+    $pathtmpactive = $pathtmp.SLASH.
+                $nextfile.".".$self->new_lock_filename().".active";
 
     if (!sysopen (LOCK, $pathtmpactive, O_WRONLY|O_CREAT|O_EXCL,
         $self->{queue_file_mode}))
@@ -366,7 +441,7 @@ sub pickup_queued_job {
     print LOCK $self->gethostname(), "\n", $$, "\n";
     close LOCK;
 
-    my $pathqueue = $self->catfile ($pathqueuedir, $nextfile);
+    my $pathqueue = $pathqueuedir.SLASH.$nextfile;
 
     my $job = IPC::DirQueue::Job->new ($self, {
       jobid => $nextfile,
@@ -378,7 +453,7 @@ sub pickup_queued_job {
                         $pathtmpactive, $pathactivedir, $nextfile);
     if (!$pathnewactive) {
       # link failed; another worker got it before we did
-      next;
+      goto nextfile;
     }
 
     if ($pathactive ne $pathnewactive) {
@@ -387,18 +462,24 @@ sub pickup_queued_job {
 
     if (!open (IN, "<".$pathqueue)) {
       # warn "IPC::DirQueue: cannot open $pathqueue for read: $!";
-      next;
+      goto nextfile;
     }
 
     if (!$self->read_control_file ($job, \*IN)) {
-      close IN; next;
+      close IN;
+      next;
     }
     close IN;
 
+    closedir($dirfh) unless $ordered;
     return $job;
+
+nextfile:
+    unlink ($pathtmpactive);  # remove the tmp file
   }
 
-  die "oops! shouldn't get here";
+  closedir($dirfh) unless $ordered;
+  return;   # empty
 }
 
 ###########################################################################
@@ -443,7 +524,7 @@ sub wait_for_queued_job {
   }
 
   my $pathqueuedir = $self->q_subdir('queue');
-  (-d $pathqueuedir) or mkdir($pathqueuedir);
+  $self->ensure_dir_exists ($pathqueuedir);
 
   # TODO: would be nice to use fam for this, where available.  But
   # no biggie...
@@ -506,16 +587,40 @@ sub visit_all_jobs {
   my $pathqueuedir = $self->q_subdir('queue');
   my $pathactivedir = $self->q_subdir('active');
 
-  my @files = $self->get_dir_filelist_sorted($pathqueuedir);
+  my $ordered = $self->{ordered};
+  my @files;
+  my $dirfh;
+
+  if ($ordered) {
+    @files = $self->get_dir_filelist_sorted($pathqueuedir);
+    if (scalar @files <= 0) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+    }
+  } else {
+    if (!opendir ($dirfh, $pathqueuedir)) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+      if (!opendir ($dirfh, $pathqueuedir)) {
+        warn "oops? pathqueuedir bad"; return;
+      }
+    }
+  }
+
+  my $nextfile;
   while (1) {
-    my $nextfile = shift @files;
-    if (!$nextfile) {
-      # no more files in the queue
-      return;
+    if ($ordered) {
+      $nextfile = shift @files;
+    } else {
+      $nextfile = readdir($dirfh);
     }
 
-    my $pathqueue = $self->catfile($pathqueuedir, $nextfile);
-    my $pathactive = $self->catfile($pathactivedir, $nextfile);
+    if (!$nextfile) {
+      # no more files in the queue, return empty
+      last;
+    }
+
+    next if ($nextfile !~ /^\d/);
+    my $pathqueue = $pathqueuedir.SLASH.$nextfile;
+    my $pathactive = $pathactivedir.SLASH.$nextfile;
 
     my $acthost;
     my $actpid;
@@ -547,7 +652,7 @@ sub visit_all_jobs {
     &$visitor ($visitcontext, $job);
   }
 
-  die "oops! shouldn't get here";
+  closedir($dirfh) unless $ordered;
 }
 
 ###########################################################################
@@ -582,6 +687,8 @@ sub get_dir_filelist_sorted {
   return @files;
 }
 
+###########################################################################
+
 sub copy_in_to_out_fh {
   my ($self, $fhin, $callbackin, $fhout, $outfname) = @_;
 
@@ -602,7 +709,7 @@ sub copy_in_to_out_fh {
   }
   else {
     binmode $fhin;
-    while (($len = read ($fhin, $buf, 16384)) > 0) {
+    while (($len = read ($fhin, $buf, $self->{buf_size})) > 0) {
       if (!syswrite ($fhout, $buf, $len)) {
         warn "IPC::DirQueue: cannot write to $outfname: $!";
         close $fhin; close $fhout;
@@ -622,13 +729,13 @@ sub copy_in_to_out_fh {
 
 sub link_into_dir {
   my ($self, $job, $pathtmp, $pathlinkdir, $qfname) = @_;
-  (-d $pathlinkdir) or mkdir($pathlinkdir);
+  $self->ensure_dir_exists ($pathlinkdir);
   my $path;
 
   # retry 10 times; add a random few digits on link(2) failure
   my $maxretries = 10;
   for my $retry (1 .. $maxretries) {
-    $path = $self->catfile($pathlinkdir, $qfname);
+    $path = $pathlinkdir.SLASH.$qfname;
 
     if (link ($pathtmp, $path)) {
       last; # got it
@@ -665,9 +772,9 @@ sub link_into_dir {
 
 sub link_into_dir_no_retry {
   my ($self, $job, $pathtmp, $pathlinkdir, $qfname) = @_;
-  (-d $pathlinkdir) or mkdir($pathlinkdir);
+  $self->ensure_dir_exists ($pathlinkdir);
 
-  my $path = $self->catfile($pathlinkdir, $qfname);
+  my $path = $pathlinkdir.SLASH.$qfname;
   if (!link ($pathtmp, $path))
   {
     # link() may return failure, even if it succeeded.
@@ -782,46 +889,50 @@ sub q_dir {
 
 sub q_subdir {
   my ($self, $subdir) = @_;
-  return $self->q_dir().'/'.$subdir;
-}
-
-sub catfile {
-  my ($self, $dir, $file) = @_;
-  return $dir.'/'.$file;
+  return $self->q_dir().SLASH.$subdir;
 }
 
 sub new_q_filename {
-  my ($self, $job, $userand) = @_;
+  my ($self, $job, $addextra) = @_;
 
   my @gmt = gmtime ($job->{time_submitted_secs});
 
-  # NN.20040718140300MMMM.hostname.$$
+  # NN20040718140300MMMM.hash(hostname.$$)[.rand]
   #
   # NN = priority, default 50
   # MMMM = microseconds from Time::HiRes::gettimeofday()
   # hostname = current hostname
 
-  my $buf = sprintf ("%02d.%04d%02d%02d%02d%02d%02d.%06d.%s.%d",
+  my $buf = sprintf ("%02d.%04d%02d%02d%02d%02d%02d%06d.%s",
         $job->{pri},
         $gmt[5]+1900, $gmt[4]+1, $gmt[3], $gmt[2], $gmt[1], $gmt[0],
-        $job->{time_submitted_msecs}, $self->gethostname(),
-        $$);
+        $job->{time_submitted_msecs},
+        hash_string_to_filename ($self->gethostname().$$));
 
-  if ($userand) {
-    $buf .= ".".$self->get_random_int();
+  # normally, this isn't used.  but if there's a collision,
+  # all retries after that will do this; in this case, the
+  # extra anti-collision stuff is useful
+  if ($addextra) {
+    $buf .= ".".$$.".".$self->get_random_int();
   }
 
   return $buf;
 }
 
+sub hash_string_to_filename {
+  my ($str) = @_;
+  # get a 16-bit checksum of the input, then uuencode that string
+  $str = pack ("u*", unpack ("%16C*", $str));
+  # transcode from uuencode-space into safe, base64-ish space
+  $str =~ y/ -_/A-Za-z0-9+_/;
+  # and remove the stuff that wasn't in that "safe" range
+  $str =~ y/A-Za-z0-9+_//cd;
+  return $str;
+}
+
 sub new_lock_filename {
   my ($self) = @_;
-
-  my $buf = sprintf ("%d.%s.%d", time, $self->gethostname(), $$);
-  #if ($userand) {
-  #$buf .= ".".$self->get_random_int();
-  #}
-  return $buf;
+  return sprintf ("%d.%s.%d", time, $self->gethostname(), $$);
 }
 
 sub get_random_int {
@@ -860,6 +971,28 @@ sub gethostname {
   return $self->{myhostname};
 }
 
+sub ensure_dir_exists {
+  my ($self, $dir) = @_;
+  return if exists ($self->{ensured_dir_exists}->{$dir});
+  $self->{ensured_dir_exists}->{$dir} = 1;
+  (-d $dir) or mkdir($dir);
+}
+
+sub queuedir_is_bad {
+  my ($self, $pathqueuedir) = @_;
+
+  # try creating the dir; it may not exist yet
+  $self->ensure_dir_exists ($pathqueuedir);
+  if (!opendir (RETRY, $pathqueuedir)) {
+    # still can't open it! problem
+    warn "IPC::DirQueue: cannot open queue dir \"$pathqueuedir\": $!\n";
+    return 1;
+  }
+  # otherwise, we could open it -- it just needed to be created.
+  closedir RETRY;
+  return 0;
+}
+
 ###########################################################################
 
 1;
@@ -869,7 +1002,7 @@ sub gethostname {
 =head1 STALE LOCKS AND SIGNAL HANDLING
 
 If interrupted or terminated, dequeueing processes should be careful to
-either call C<$job->finish()> or C<$job->return_to_queue()> on any active
+either call C<$job-E<gt>finish()> or C<$job-E<gt>return_to_queue()> on any active
 tasks before exiting -- otherwise those jobs will remain marked I<active>.
 
 Stale locks are normally dealt with automatically.  If a lock is still
@@ -883,6 +1016,60 @@ modified, the lock file is deleted.
 Note: this means that if the dequeueing processes are spread among
 multiple machines, and there is no longer a dequeuer running on the
 machine that initially 'locked' the task, it will never be unlocked.
+
+=head1 QUEUE DIRECTORY STRUCTURE
+
+C<IPC::DirQueue> maintains the following structure for a queue directory:
+
+=over 4
+
+=item queue directory
+
+The B<queue> directory is used to store the queue control files.  Queue
+control files determine what jobs are active; if a job has a queue
+control file in this directory, it is active.
+
+The filename format is as follows:
+
+    50.20040909232529941258.HASH[.PID.RAND]
+
+The first two digits (C<50>) are the priority of the job.  Lower priority
+numbers are run first.  C<20040909232529> is the current date and time when the
+enqueueing process ran, in C<YYYYMMDDHHMMSS> format.   C<941258> is the time in
+microseconds, as returned by C<gettimeofday()>.  And finally, C<HASH> is a
+variable-length hash of some semi-random data, used to increase the chance of
+uniqueness.
+
+If there is a collision, the timestamps are regenerated after a 250 msec sleep,
+and further randomness will be added at the end of the string (namely, the
+current process ID and a random integer value).   Multiple retries are
+attempted until the file is atomically moved into the B<queue> directory
+without collision.
+
+=item data directory
+
+The B<data> directory is used to store enqueued data files.
+
+It contains a two-level "fan-out" hashed directory structure; each data file is
+stored under a single-letter directory, which in turn is under a single-letter
+directory.   This increases efficiency of directory lookups.
+
+The format of filenames here is similar to that used in the B<queue> directory,
+except that the last two characters are removed and used instead for the
+"fan-out" directory names.
+
+=item tmp directory
+
+The B<tmp> directory contains temporary work files that are in the process
+of enqueueing, and not ready ready for processing.
+
+The filename format here is similar to the above, with suffixes indicating
+the type of file (".ctrl", ".data").
+
+=back
+
+Atomic, NFS-safe renaming is used to avoid collisions, overwriting or
+other unsafe operations.
 
 =head1 SEE ALSO
 
