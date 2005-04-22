@@ -1,4 +1,28 @@
 ------------------------------------------------------------------------
+r929 | jmason | 2005-03-15 15:12:28 -0800 (Tue, 15 Mar 2005) | 1 line
+
+more paranoid link_into_dir_no_retry implementation, hopefully will fix a bug that leaves tmp active files lying around
+------------------------------------------------------------------------
+r863 | jmason | 2005-02-08 16:58:22 -0800 (Tue, 08 Feb 2005) | 1 line
+
+redo the enqueue_sub() API; the read() style of string/empty-str/undef produced really messy, complex calling code, so just go with a more perlish string/undef/die() API instead
+------------------------------------------------------------------------
+r862 | jmason | 2005-02-08 16:16:50 -0800 (Tue, 08 Feb 2005) | 1 line
+
+bump version number; not yet ready for a release, but worth doing this before I forget
+------------------------------------------------------------------------
+r861 | jmason | 2005-02-08 16:12:08 -0800 (Tue, 08 Feb 2005) | 1 line
+
+added enqueue_sub() API, to enqueue data from a closure
+------------------------------------------------------------------------
+r857 | jmason | 2005-02-06 20:31:14 -0800 (Sun, 06 Feb 2005) | 1 line
+
+skip fork()-requiring tests on win32; failure log at http://www.nntp.perl.org/group/perl.cpan.testers/179567
+------------------------------------------------------------------------
+r663 | jmason | 2005-01-18 17:09:00 -0800 (Tue, 18 Jan 2005) | 1 line
+
+RELEASING 0.04
+------------------------------------------------------------------------
 r662 | jmason | 2005-01-12 18:26:40 -0800 (Wed, 12 Jan 2005) | 1 line
 
 add note about mailing list

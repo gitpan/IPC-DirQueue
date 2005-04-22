@@ -63,10 +63,11 @@ use bytes;
 use Time::HiRes qw();
 use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_RDONLY);
 use IPC::DirQueue::Job;
+use Errno qw(EEXIST);
 
 our @ISA = ();
 
-our $VERSION = 0.04;
+our $VERSION = 0.05;
 
 use constant SLASH => '/';
 
@@ -181,11 +182,12 @@ sub enqueue_file {
   return $ret;
 }
 
-=item $dq->enqueue_fh ($filename [, $metadata [, $pri] ] );
+=item $dq->enqueue_fh ($filehandle [, $metadata [, $pri] ] );
 
 Enqueue a new job for processing. Returns C<1> if the job was enqueued, or
 C<undef> on failure. C<$pri> and C<$metadata> are as described in
-C<$dq-E<gt>enqueue_file()>.
+C<$dq-E<gt>enqueue_file()>.  C<$filehandle> is a perl file handle
+that must be open for reading.
 
 =cut
 
@@ -206,10 +208,39 @@ C<$pri> and C<$metadata> are as described in C<$dq-E<gt>enqueue_file()>.
 
 sub enqueue_string {
   my ($self, $string, $metadata, $pri) = @_;
+  my $enqd_already = 0;
   return $self->enqueue_backend ($metadata, $pri, undef,
         sub {
+          return if $enqd_already++;
           return $string;
         });
+}
+
+=item $dq->enqueue_sub ($subref [, $metadata [, $pri] ] );
+
+Enqueue a new job for processing. Returns C<1> if the job was enqueued, or
+C<undef> on failure. C<$pri> and C<$metadata> are as described in
+C<$dq-E<gt>enqueue_file()>.
+
+C<$subref> is a perl subroutine, which is expected to return one of the
+following each time it is called:
+
+    - a string of data bytes to be appended to any existing data.  (the
+      string may be empty, C<''>, in which case it's a no-op.)
+
+    - C<undef> when the enqueued data has ended, ie. EOF.
+
+    - C<die()> if an error occurs.  The C<die()> message will be converted into
+      a warning, and the C<enqueue_sub()> call will return C<undef>.
+
+(Tip: note that this is a closure, so variables outside the subroutine can be
+accessed safely.)
+
+=cut
+
+sub enqueue_sub {
+  my ($self, $subref, $metadata, $pri) = @_;
+  return $self->enqueue_backend ($metadata, $pri, undef, $subref);
 }
 
 # private implementation.
@@ -250,8 +281,14 @@ sub enqueue_backend {
   }
   my $pathtmpdata_created = 1;
 
-  my $siz = $self->copy_in_to_out_fh ($fhin, $callbackin,
+  my $siz;
+  eval {
+    $siz = $self->copy_in_to_out_fh ($fhin, $callbackin,
                               \*OUT, $pathtmpdata);
+  };
+  if ($@) {
+    warn "IPC::DirQueue: enqueue failed: $@";
+  }
   if (!defined $siz) {
     goto failure;
   }
@@ -396,6 +433,7 @@ sub pickup_queued_job {
 
       if ($self->worker_still_working($pathactive)) {
         # worker is still alive, although not updating the lock
+        dbg ("worker still working, skip: $pathactive");
         next;
       }
 
@@ -412,11 +450,13 @@ sub pickup_queued_job {
       # that dqproc2 will wait for possibly much longer than
       # dqproc1 before it decides to unlink it.
       #
-      # this isn't perfect.  TODO: is there a "rename this fd" syscall?
+      # this isn't perfect.  TODO: is there a "rename this fd" syscall
+      # accessible from perl?
 
       my $fudge = get_random_int() % 255;
       if (time() - $mtime < 600+$fudge) {
         # within the fudge zone.  don't unlink it in this process.
+        dbg ("within active fudge zone, skip: $pathactive");
         next;
       }
 
@@ -437,8 +477,14 @@ sub pickup_queued_job {
     if (!sysopen (LOCK, $pathtmpactive, O_WRONLY|O_CREAT|O_EXCL,
         $self->{queue_file_mode}))
     {
-      # could have contention; skip this file
-      dbg ("IPC::DirQueue: cannot open $pathtmpactive for write: $!");
+      if ($!{EEXIST}) {
+        # contention; skip this file
+        dbg ("IPC::DirQueue: $pathtmpactive already created, skipping: $!");
+      }
+      else {
+        # could be serious; disk space, permissions etc.
+        warn "IPC::DirQueue: cannot open $pathtmpactive for write: $!";
+      }
       next;
     }
     print LOCK $self->gethostname(), "\n", $$, "\n";
@@ -456,6 +502,7 @@ sub pickup_queued_job {
                         $pathtmpactive, $pathactivedir, $nextfile);
     if (!$pathnewactive) {
       # link failed; another worker got it before we did
+      unlink $pathtmpactive;
       goto nextfile;
     }
 
@@ -464,7 +511,7 @@ sub pickup_queued_job {
     }
 
     if (!open (IN, "<".$pathqueue)) {
-      # warn "IPC::DirQueue: cannot open $pathqueue for read: $!";
+      dbg("IPC::DirQueue: cannot open $pathqueue for read: $!");
       goto nextfile;
     }
 
@@ -643,7 +690,8 @@ sub visit_all_jobs {
     });
 
     if (!open (IN, "<".$pathqueue)) {
-      next;      # queue file has disappeared (job finished)
+      dbg ("queue file disappeared, job finished? skip: $pathqueue");
+      next;
     }
 
     if (!$self->read_control_file ($job, \*IN)) {
@@ -701,14 +749,22 @@ sub copy_in_to_out_fh {
 
   binmode $fhout;
   if ($callbackin) {
-    my $stringin = $callbackin->();
-    $len = length ($stringin);
-    if (!syswrite ($fhout, $stringin, $len)) {
-      warn "IPC::DirQueue: cannot write to $outfname: $!";
-      close $fhout;
-      return;
+    while (1) {
+      my $stringin = $callbackin->();
+
+      if (!defined($stringin)) {
+        last;       # EOF
+      }
+
+      $len = length ($stringin);
+      next if ($len == 0);  # empty string, nothing to write
+      if (!syswrite ($fhout, $stringin, $len)) {
+        warn "IPC::DirQueue: enqueue: cannot write to $outfname: $!";
+        close $fhout;
+        return;
+      }
+      $siz += $len;
     }
-    $siz += $len;
   }
   else {
     binmode $fhin;
@@ -774,6 +830,7 @@ sub link_into_dir {
     # non-fatal, we can still continue anyway
   }
 
+  dbg ("link_into_dir return: $path");
   return $path;
 }
 
@@ -781,28 +838,49 @@ sub link_into_dir_no_retry {
   my ($self, $job, $pathtmp, $pathlinkdir, $qfname) = @_;
   $self->ensure_dir_exists ($pathlinkdir);
 
-  dbg ("link_into_dir_no_retry $pathtmp $pathlinkdir/$qfname");
+  dbg ("lidnr: $pathtmp $pathlinkdir/$qfname");
 
-  my $path = $pathlinkdir.SLASH.$qfname;
-  if (!link ($pathtmp, $path))
-  {
-    # link() may return failure, even if it succeeded.
-    # use lstat() to verify that link() really failed.
-    my ($dev,$ino,$mode,$nlink,$uid) = lstat($pathtmp);
-    if ($nlink != 2) {
-      dbg ("link_into_dir_no_retry nlinks $nlink != 2: $pathtmp");
-      unlink ($pathtmp);	# just in case
-      return;			# ok, it really failed
-    }
+  my ($dev1,$ino1,$mode1,$nlink1,$uid1) = lstat($pathtmp);
+  if (!defined $nlink1) {
+    warn ("lidnr: tmp file disappeared?! $pathtmp");
+    return;         # not going to have much luck here
   }
 
+  my $path = $pathlinkdir.SLASH.$qfname;
+
+  if (-f $path) {
+    dbg ("lidnr: target file already exists: $path");
+    return;         # we've been beaten to it
+  }
+
+  link ($pathtmp, $path) or dbg("link failure, recovering: $!");
+
+  # link() may return failure, even if it succeeded. use lstat() to verify that
+  # link() really failed.  use lstat() even if it reported success, just to be
+  # sure. ;)
+
+  my ($dev3,$ino3,$mode3,$nlink3,$uid3) = lstat($path);
+  if (!defined $nlink3) {
+    dbg ("lidnr: link failed, target file nonexistent: $path");
+    return;
+  }
+
+  # now, be paranoid and verify that the inode data is identical
+  if ($dev1 != $dev3 || $ino1 != $ino3 || $uid1 != $uid3) {
+    # the tmpfile and the target don't match each other.  this is
+    # an error.  warn and recover
+    warn ("lidnr: tmp file doesn't match target: $pathtmp $path");
+    return;
+  }
+  
   # got it! unlink(2) the tmp file, since we don't need it.
-  dbg ("link_into_dir_no_retry unlink tmp file: $pathtmp");
+  dbg ("lidnr: unlink tmp file: $pathtmp");
   if (!unlink ($pathtmp)) {
     warn "IPC::DirQueue: cannot unlink $pathtmp";
     # non-fatal, we can still continue anyway
   }
 
+  dbg ("lidnr: return: $path");
   return $path;
 }
 
