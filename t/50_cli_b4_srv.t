@@ -2,21 +2,26 @@
 
 our $SKIP = ($^O =~ /^(mswin|dos|os2)/oi);
 
-use Test; BEGIN { plan tests => $SKIP ? 0 : 113 };
-exit if $SKIP;
+use Test; BEGIN { plan tests => 19 };
 
 use lib '../lib'; if (-d 't') { chdir 't'; }
 use IPC::DirQueue;
 
-mkdir ("log");
-mkdir ("log/qdir");
+use File::Path;
+
+rmtree ("log");
+ok mkdir ("log");
+ok mkdir ("log/qdir");
 my $bq = IPC::DirQueue->new({ dir => 'log/qdir' });
 ok ($bq);
 
 unlink ("log/counter");
 
+start_writer();
+sleep 1;
+
 my @pids = ();
-for my $i (0 .. 4) {
+for my $i (0 .. 1) {
   my $pid = fork();
   if ($pid) {
     push (@pids, $pid);
@@ -26,9 +31,8 @@ for my $i (0 .. 4) {
     start_worker();
   }
 }
-start_writer();
 
-for my $i (0 .. 60) {
+for my $i (0 .. 10) {
   sleep 1;
   my $count = (-s "log/counter");
   if (!defined $count) {
@@ -36,7 +40,7 @@ for my $i (0 .. 60) {
     system ("ls -l log/counter");
     die;
   }
-  if ($count && $count >= 100) {
+  if ($count && $count == 10) {
     last;
   }
   print "count: $count\n";
@@ -45,7 +49,7 @@ for my $i (0 .. 60) {
 ok (1);
 kill (15, @pids);
 
-for my $i (0 .. 4) {
+for my $i (0 .. 1) {
   waitpid ($pids[$i], 0) or die "waitpid failed";
   ok (1);
 }
@@ -71,9 +75,11 @@ sub start_worker {
 }
 
 sub start_writer {
-  for my $j (1 .. 100) {
+  for my $j (1 .. 10) {
     ok ($bq->enqueue_string ("hello world! $$", { foo => "bar $$" }));
+    print "cli in $$: sent $j\n";
     sleep 0.05;
   }
+  print "cli in $$: finished\n";
 }
 

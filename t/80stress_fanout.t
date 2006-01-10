@@ -10,7 +10,7 @@ use IPC::DirQueue;
 
 mkdir ("log");
 mkdir ("log/qdir");
-my $bq = IPC::DirQueue->new({ dir => 'log/qdir' });
+my $bq = IPC::DirQueue->new({ dir => 'log/qdir', queue_fanout => 1 });
 ok ($bq);
 
 unlink ("log/counter");
@@ -31,11 +31,6 @@ start_writer();
 for my $i (0 .. 60) {
   sleep 1;
   my $count = (-s "log/counter");
-  if (!defined $count) {
-    warn "log/counter disappeared: $@ $!";
-    system ("ls -l log/counter");
-    die;
-  }
   if ($count && $count >= 100) {
     last;
   }
@@ -56,7 +51,6 @@ use Time::HiRes qw(sleep);
 
 sub start_worker {
   my $k = 0;
-  print "worker $$: forked\n";
   while (1) {
     my $job = $bq->wait_for_queued_job();
     if (!$job) { next; }

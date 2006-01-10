@@ -63,11 +63,12 @@ use bytes;
 use Time::HiRes qw();
 use Fcntl qw(O_WRONLY O_CREAT O_EXCL O_RDONLY);
 use IPC::DirQueue::Job;
+use IPC::DirQueue::IndexClient;
 use Errno qw(EEXIST);
 
 our @ISA = ();
 
-our $VERSION = 0.05;
+our $VERSION = 0.06;
 
 use constant SLASH => '/';
 
@@ -106,9 +107,27 @@ current process C<umask>.
 Whether the jobs should be processed in order of submission, or
 in no particular order.
 
+=item queue_fanout => { 0 | 1 } (default: 0)
+
+Whether the queue directory should be 'fanned out'.  This allows better
+scalability with NFS-shared queues with large numbers of pending files, but
+hurts performance otherwise.   It also implies B<ordered> = 0. (This is
+strictly experimental, has overall poor performance, and is not recommended.)
+
+=item indexd_uri => $uri (default: undef)
+
+A URI of a C<dq-indexd> daemon, used to maintain the list of waiting jobs.  The
+URI must be of the form  C<dq://hostname[:port]> . (This is strictly
+experimental, and is not recommended.)
+
 =item buf_size => $number (default: 65536)
 
 The buffer size to use when copying files, in bytes.
+
+=item active_file_lifetime => $number (default: 600)
+
+The lifetime of an untouched active lockfile, in seconds.  See 'STALE LOCKS AND
+SIGNAL HANDLING', below, for more details.
 
 =back
 
@@ -128,17 +147,30 @@ sub new {
   $self->{queue_file_mode} ||= '0666';
   $self->{queue_file_mode} = oct ($self->{queue_file_mode});
 
-  if (!defined $self->{ordered}) {
+  if ($self->{queue_fanout}) {
+    $self->{queue_fanout} = 1;
+    $self->{ordered} = 0;           # fanout wins
+  }
+  elsif (!defined $self->{ordered}) {
     $self->{ordered} = 1;
   }
 
   $self->{buf_size} ||= 65536;
+  $self->{active_file_lifetime} ||= 600;
 
   $self->{ensured_dir_exists} = { };
   $self->ensure_dir_exists ($self->{dir});
 
+  if ($self->{indexd_uri}) {
+    $self->{indexclient} = IPC::DirQueue::IndexClient->new({
+            uri => $self->{indexd_uri}
+          });
+  }
+
   $self;
 }
+
+sub dbg;
 
 ###########################################################################
 
@@ -164,7 +196,13 @@ brings with it several restrictions:
 
 =back
 
-If those restrictions are broken, that metadatum will be silently dropped.
+If those restrictions are broken, die() will be called with the following
+error:
+
+      die "IPC::DirQueue: invalid metadatum: '$k'";
+
+This is a change added in release 0.06; prior to that, that metadatum would be
+silently dropped.
 
 An optional priority can be specified; lower priorities are run first.
 Priorities range from 0 to 99, and 50 is default.
@@ -177,7 +215,7 @@ sub enqueue_file {
     warn "IPC::DirQueue: cannot open $file for read: $!";
     return;
   }
-  my $ret = $self->enqueue_backend ($metadata, $pri, \*IN);
+  my $ret = $self->_enqueue_backend ($metadata, $pri, \*IN);
   close IN;
   return $ret;
 }
@@ -187,13 +225,14 @@ sub enqueue_file {
 Enqueue a new job for processing. Returns C<1> if the job was enqueued, or
 C<undef> on failure. C<$pri> and C<$metadata> are as described in
 C<$dq-E<gt>enqueue_file()>.  C<$filehandle> is a perl file handle
-that must be open for reading.
+that must be open for reading.  It will be closed on completion,
+regardless of success or failure.
 
 =cut
 
 sub enqueue_fh {
   my ($self, $fhin, $metadata, $pri) = @_;
-  my $ret = $self->enqueue_backend ($metadata, $pri, $fhin);
+  my $ret = $self->_enqueue_backend ($metadata, $pri, $fhin);
   close $fhin;
   return $ret;
 }
@@ -209,7 +248,7 @@ C<$pri> and C<$metadata> are as described in C<$dq-E<gt>enqueue_file()>.
 sub enqueue_string {
   my ($self, $string, $metadata, $pri) = @_;
   my $enqd_already = 0;
-  return $self->enqueue_backend ($metadata, $pri, undef,
+  return $self->_enqueue_backend ($metadata, $pri, undef,
         sub {
           return if $enqd_already++;
           return $string;
@@ -240,11 +279,11 @@ accessed safely.)
 
 sub enqueue_sub {
   my ($self, $subref, $metadata, $pri) = @_;
-  return $self->enqueue_backend ($metadata, $pri, undef, $subref);
+  return $self->_enqueue_backend ($metadata, $pri, undef, $subref);
 }
 
 # private implementation.
-sub enqueue_backend {
+sub _enqueue_backend {
   my ($self, $metadata, $pri, $fhin, $callbackin) = @_;
 
   if (!defined($pri)) { $pri = 50; }
@@ -338,10 +377,29 @@ sub enqueue_backend {
 
   # now link(2) that into the 'queue' dir.
   my $pathqueuedir = $self->q_subdir('queue');
+  my $fanout = $self->queue_dir_fanout_create($pathqueuedir);
+
   my $pathqueue = $self->link_into_dir ($job, $pathtmpctrl,
-                                    $pathqueuedir, $qcnametmp);
+                $self->queue_dir_fanout_path($pathqueuedir, $fanout),
+                $qcnametmp);
+
   if (!$pathqueue) {
+    dbg ("failed to link_into_dir, enq failed");
     goto failure;
+  }
+
+  # and incr the fanout counter for that fanout dir
+  $self->queue_dir_fanout_commit($pathqueuedir, $fanout);
+
+  # touch the "queue" directory to indicate that it's changed
+  # and a file has been enqueued; required to support Reiserfs
+  # and XFS, where this is not implicit
+  $pathqueuedir = $self->q_subdir('queue');
+  utime undef, undef, $pathqueuedir;
+  dbg ("touched $pathqueuedir at ".time);
+
+  if ($self->{indexclient}) {
+    $self->{indexclient}->enqueue($pathqueuedir, $pathqueue);
   }
 
   # my $pathqueue_created = 1;     # not required, we're done!
@@ -383,41 +441,20 @@ sub pickup_queued_job {
   my $pathactivedir = $self->q_subdir('active');
   $self->ensure_dir_exists ($pathactivedir);
 
-  my $ordered = $self->{ordered};
-  my @files;
-  my $dirfh;
+  my $iter = $self->queue_iter_start($pathqueuedir);
 
-  if ($ordered) {
-    @files = $self->get_dir_filelist_sorted($pathqueuedir);
-    if (scalar @files <= 0) {
-      return if $self->queuedir_is_bad($pathqueuedir);
-    }
-  } else {
-    if (!opendir ($dirfh, $pathqueuedir)) {
-      return if $self->queuedir_is_bad($pathqueuedir);
-      if (!opendir ($dirfh, $pathqueuedir)) {
-        warn "oops? pathqueuedir bad"; return;
-      }
-    }
-  }
-
-  my $nextfile;
   while (1) {
-    my $pathtmpactive;
+    my $nextfile = $self->queue_iter_next($iter);
 
-    if ($ordered) {
-      $nextfile = shift @files;
-    } else {
-      $nextfile = readdir($dirfh);
-    }
-
-    if (!$nextfile) {
+    if (!defined $nextfile) {
       # no more files in the queue, return empty
       last;
     }
 
-    next if ($nextfile !~ /^\d/);
-    my $pathactive = $pathactivedir.SLASH.$nextfile;
+    my $nextfilebase = $self->queue_dir_fanout_path_strip($nextfile);
+
+    next if ($nextfilebase !~ /^\d/);
+    my $pathactive = $pathactivedir.SLASH.$nextfilebase;
 
     my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
         $atime,$mtime,$ctime,$blksize,$blocks) = lstat($pathactive);
@@ -426,7 +463,7 @@ sub pickup_queued_job {
       # *DO* call time() here.  In extremely large dirs, it may take
       # several seconds to traverse the entire listing from start
       # to finish!
-      if (time() - $mtime < 600) {
+      if (time() - $mtime < $self->{active_file_lifetime}) {
         # active lockfile; it's being worked on.  skip this file
         next;
       }
@@ -453,15 +490,15 @@ sub pickup_queued_job {
       # this isn't perfect.  TODO: is there a "rename this fd" syscall
       # accessible from perl?
 
-      my $fudge = get_random_int() % 255;
-      if (time() - $mtime < 600+$fudge) {
+      my $fudge = get_random_int() % 256;
+      if (time() - $mtime < $self->{active_file_lifetime}+$fudge) {
         # within the fudge zone.  don't unlink it in this process.
         dbg ("within active fudge zone, skip: $pathactive");
         next;
       }
 
       # else, we can kill the stale lockfile
-      unlink $pathactive;
+      unlink $pathactive or warn "IPC::DirQueue: unlink failed: $pathactive";
       warn "IPC::DirQueue: killed stale lockfile: $pathactive";
     }
 
@@ -470,8 +507,8 @@ sub pickup_queued_job {
     $self->ensure_dir_exists ($pathtmp);
 
     # use the name of the queue file itself, plus a tmp prefix, plus active
-    $pathtmpactive = $pathtmp.SLASH.
-                $nextfile.".".$self->new_lock_filename().".active";
+    my $pathtmpactive = $pathtmp.SLASH.
+                $nextfilebase.".".$self->new_lock_filename().".active";
 
     dbg ("creating tmp active $pathtmpactive");
     if (!sysopen (LOCK, $pathtmpactive, O_WRONLY|O_CREAT|O_EXCL,
@@ -492,17 +529,25 @@ sub pickup_queued_job {
 
     my $pathqueue = $pathqueuedir.SLASH.$nextfile;
 
+    if (!-f $pathqueue) {
+      # queue file already gone; another worker got it before we did.
+      # catch this case before we create a lockfile.
+      # see the "pathqueue_gone" comment below for an explanation
+      dbg("IPC::DirQueue: $pathqueue no longer exists, skipping");
+      goto nextfile;
+    }
+
     my $job = IPC::DirQueue::Job->new ($self, {
-      jobid => $nextfile,
+      jobid => $nextfilebase,
       pathqueue => $pathqueue,
       pathactive => $pathactive
     });
 
     my $pathnewactive = $self->link_into_dir_no_retry ($job,
-                        $pathtmpactive, $pathactivedir, $nextfile);
-    if (!$pathnewactive) {
+                        $pathtmpactive, $pathactivedir, $nextfilebase);
+    if (!defined($pathnewactive)) {
       # link failed; another worker got it before we did
-      unlink $pathtmpactive;
+      # no need to unlink tmpfile, the "nextfile" action will do that
       goto nextfile;
     }
 
@@ -510,25 +555,35 @@ sub pickup_queued_job {
       die "oops! active paths differ: $pathactive $pathnewactive";
     }
 
-    if (!open (IN, "<".$pathqueue)) {
+    if (!open (IN, "<".$pathqueue))
+    {
+      # since we read the list of files upfront, this can happen:
+      #
+      # dqproc1: [gets lock] [work] [finish_job]
+      # dqproc2:                                 [gets lock]
+      #
+      # "dqproc1" has already completed the job, unlinking both the active
+      # *and* queue files, by the time "dqproc2" gets to it.  This is OK;
+      # just skip the file, since it's already done.  [pathqueue_gone]
+
       dbg("IPC::DirQueue: cannot open $pathqueue for read: $!");
-      goto nextfile;
+      unlink $pathnewactive;
+      next;     # NOT "goto nextfile", as pathtmpactive is already unlinked
     }
 
-    if (!$self->read_control_file ($job, \*IN)) {
-      close IN;
-      next;
-    }
+    my $red = $self->read_control_file ($job, \*IN);
     close IN;
 
-    closedir($dirfh) unless $ordered;
+    next if (!$red);
+
+    $self->queue_iter_stop($iter);
     return $job;
 
 nextfile:
-    unlink ($pathtmpactive);  # remove the tmp file
+    unlink $pathtmpactive or warn "IPC::DirQueue: unlink failed: $pathtmpactive";
   }
 
-  closedir($dirfh) unless $ordered;
+  $self->queue_iter_stop($iter);
   return;   # empty
 }
 
@@ -567,6 +622,8 @@ sub wait_for_queued_job {
     $finishtime = time + int ($timeout);
   }
 
+  dbg "wait_for_queued_job starting";
+
   if ($pollintvl) {
     $pollintvl *= 1000000;  # from secs to usecs
   } else {
@@ -583,27 +640,62 @@ sub wait_for_queued_job {
     # check the stat time on the queue dir *before* we call pickup,
     # to avoid a race condition where a job is added while we're
     # checking in that function.
+
     my @stat = stat ($pathqueuedir);
     my $qdirlaststat = $stat[9];
 
     my $job = $self->pickup_queued_job();
     if ($job) { return $job; }
 
+    # there's another semi-race condition here, brought about by a lack of
+    # sub-second precision from stat(2).  if the last enq occurred inside
+    # *this* current 1-second window, then *another* one can happen inside this
+    # second right afterwards, and we wouldn't notice.
+
+    # in other words (ASCII-art alert):
+    #    TIME   | t                                         | t+1
+    #    E      |          enq                      enq     |
+    #    D      |    stat       pickup_queued_job           |
+
+    # the enqueuer process E enqueues a job just after the stat, inside the
+    # 1-second period "t".  dequeuer process D dequeues it with
+    # pickup_queued_job(). all is well.  But then, E enqueues another job
+    # inside the same 1-second period "t", and since the stat() has already
+    # happened for "t", and since we've already picked up the job in "t", we
+    # don't recheck; result is, we miss this enqueue event.
+    #
+    # Avoid this by checking in a busy-loop until time(2) says we're out of
+    # that "danger zone" 1-second period.  Any further enq's would then
+    # cause stat(2) to report a different timestamp.
+
+    while (time == $qdirlaststat) {
+      Time::HiRes::usleep ($pollintvl);
+      dbg "wait_for_queued_job: spinning until time != stat $qdirlaststat";
+      my $job = $self->pickup_queued_job();
+      if ($job) { return $job; }
+    }
+
     # sleep until the directory's mtime changes from what it was when
     # we ran pickup_queued_job() last.
+
+    dbg "wait_for_queued_job: sleeping on $pathqueuedir";
     while (1) {
       my $now = time;
       if ($finishtime && $now >= $finishtime) {
+        dbg "wait_for_queued_job timed out";
         return undef;           # out of time
       }
 
       Time::HiRes::usleep ($pollintvl);
 
-      my @stat = stat ($pathqueuedir);
-      if ($stat[9] != $qdirlaststat) {
-        last;                   # activity! try a pickup_queued_job() call
-      }
+      @stat = stat ($pathqueuedir);
+      # dbg "wait_for_queued_job: stat $stat[9] $qdirlaststat $pathqueuedir";
+      last if (defined $stat[9] &&
+            ((defined $qdirlaststat && $stat[9] != $qdirlaststat)
+                    || !defined $qdirlaststat));
     }
+
+    dbg "wait_for_queued_job: activity, calling pickup";
   }
 }
 
@@ -637,40 +729,24 @@ sub visit_all_jobs {
   my $pathqueuedir = $self->q_subdir('queue');
   my $pathactivedir = $self->q_subdir('active');
 
-  my $ordered = $self->{ordered};
-  my @files;
-  my $dirfh;
-
-  if ($ordered) {
-    @files = $self->get_dir_filelist_sorted($pathqueuedir);
-    if (scalar @files <= 0) {
-      return if $self->queuedir_is_bad($pathqueuedir);
-    }
-  } else {
-    if (!opendir ($dirfh, $pathqueuedir)) {
-      return if $self->queuedir_is_bad($pathqueuedir);
-      if (!opendir ($dirfh, $pathqueuedir)) {
-        warn "oops? pathqueuedir bad"; return;
-      }
-    }
-  }
+  my $iter = $self->queue_iter_start($pathqueuedir);
 
   my $nextfile;
   while (1) {
-    if ($ordered) {
-      $nextfile = shift @files;
-    } else {
-      $nextfile = readdir($dirfh);
-    }
+    $nextfile = $self->queue_iter_next($iter);
 
-    if (!$nextfile) {
+    if (!defined $nextfile) {
       # no more files in the queue, return empty
       last;
     }
 
-    next if ($nextfile !~ /^\d/);
+    my $nextfilebase = $self->queue_dir_fanout_path_strip($nextfile);
+
+    next if ($nextfilebase !~ /^\d/);
     my $pathqueue = $pathqueuedir.SLASH.$nextfile;
-    my $pathactive = $pathactivedir.SLASH.$nextfile;
+    my $pathactive = $pathactivedir.SLASH.$nextfilebase;
+
+    next if (!-f $pathqueue);
 
     my $acthost;
     my $actpid;
@@ -682,7 +758,7 @@ sub visit_all_jobs {
 
     my $job = IPC::DirQueue::Job->new ($self, {
       is_readonly => 1,     # means finish() will not rm files
-      jobid => $nextfile,
+      jobid => $nextfilebase,
       active_host => $acthost,
       active_pid => $actpid,
       pathqueue => $pathqueue,
@@ -694,16 +770,18 @@ sub visit_all_jobs {
       next;
     }
 
-    if (!$self->read_control_file ($job, \*IN)) {
-      warn "IPC::DirQueue: cannot read control file: $pathqueue";
-      close IN; next;
-    }
+    my $red = $self->read_control_file ($job, \*IN);
     close IN;
+
+    if (!$red) {
+      warn "IPC::DirQueue: cannot read control file: $pathqueue";
+      next;
+    }
 
     &$visitor ($visitcontext, $job);
   }
 
-  closedir($dirfh) unless $ordered;
+  $self->queue_iter_stop($iter);
 }
 
 ###########################################################################
@@ -712,16 +790,30 @@ sub visit_all_jobs {
 sub finish_job {
   my ($self, $job, $isdone) = @_;
 
+  dbg ("finish_job: ", $job->{pathactive});
+
   if ($job->{is_readonly}) {
     return;
   }
 
   if ($isdone) {
-    unlink ($job->{pathqueue});
-    unlink ($job->{QDFN});
+    unlink($job->{pathqueue})
+            or warn "IPC::DirQueue: unlink failed: $job->{pathqueue}";
+    unlink($job->{QDFN})
+            or warn "IPC::DirQueue: unlink failed: $job->{QDFN}";
+
+    if ($self->{indexclient}) {
+      my $pathqueuedir = $self->q_subdir('queue');
+      $self->{indexclient}->dequeue($pathqueuedir, $job->{pathqueue});
+    }
+
+    # touch the dir so that other dequeuers re-check; activity can
+    # introduce a small race, I think.  (don't think this is necessary)
+    # utime undef, undef, $pathqueuedir;
   }
 
-  unlink ($job->{pathactive});
+  unlink($job->{pathactive})
+            or warn "IPC::DirQueue: unlink failed: $job->{pathactive}";
 }
 
 ###########################################################################
@@ -733,9 +825,9 @@ sub get_dir_filelist_sorted {
     return ();          # no dir?  nothing queued
   }
   # have to read the lot, to sort them.
-  my @files = sort { $a cmp $b } grep { /^\d/ } readdir(DIR);
+  my @files = sort grep { /^\d/ } readdir(DIR);
   closedir DIR;
-  return @files;
+  return \@files;
 }
 
 ###########################################################################
@@ -791,12 +883,12 @@ sub link_into_dir {
   $self->ensure_dir_exists ($pathlinkdir);
   my $path;
 
-  dbg ("link_into_dir $pathtmp $pathlinkdir/$qfname");
-
   # retry 10 times; add a random few digits on link(2) failure
   my $maxretries = 10;
   for my $retry (1 .. $maxretries) {
     $path = $pathlinkdir.SLASH.$qfname;
+
+    dbg ("link_into_dir retry=", $retry, " tmp=", $pathtmp, " path=", $path);
 
     if (link ($pathtmp, $path)) {
       last; # got it
@@ -838,7 +930,7 @@ sub link_into_dir_no_retry {
   my ($self, $job, $pathtmp, $pathlinkdir, $qfname) = @_;
   $self->ensure_dir_exists ($pathlinkdir);
 
-  dbg ("lidnr: $pathtmp $pathlinkdir/$qfname");
+  dbg ("lidnr: ", $pathtmp, " ", $pathlinkdir, "/", $qfname);
 
   my ($dev1,$ino1,$mode1,$nlink1,$uid1) = lstat($pathtmp);
   if (!defined $nlink1) {
@@ -853,7 +945,11 @@ sub link_into_dir_no_retry {
     return;         # we've been beaten to it
   }
 
-  link ($pathtmp, $path) or dbg("link failure, recovering: $!");
+  my $linkfailed;
+  if (!link ($pathtmp, $path)) {
+    dbg("link failure, recovering: $!");
+    $linkfailed = 1;
+  }
 
   # link() may return failure, even if it succeeded. use lstat() to verify that
   # link() really failed.  use lstat() even if it reported success, just to be
@@ -867,9 +963,13 @@ sub link_into_dir_no_retry {
 
   # now, be paranoid and verify that the inode data is identical
   if ($dev1 != $dev3 || $ino1 != $ino3 || $uid1 != $uid3) {
-    # the tmpfile and the target don't match each other.  this is
-    # an error.  warn and recover
-    warn ("lidnr: tmp file doesn't match target: $pathtmp $path");
+    # the tmpfile and the target don't match each other.
+    # if the link failed, this means that another qproc got
+    # the file before we did, which is not an error.
+    if (!$linkfailed) {
+      # link supposedly succeeded, so this *is* an error.  warn
+      warn ("lidnr: tmp file doesn't match target: $path ($dev3,$ino3,$mode3,$nlink3,$uid3) vs $pathtmp ($dev1,$ino1,$mode1,$nlink1,$uid1)");
+    }
     return;
   }
   
@@ -904,9 +1004,13 @@ sub create_control_file {
   my $md = $job->{metadata};
   foreach my $k (keys %{$md}) {
     my $v = $md->{$k};
-    next if ($k =~ /^Q...$/);
-    next if ($k =~ /[:\0\n]/);
-    next if ($v =~ /[\0\n]/);
+    if (($k =~ /^Q...$/)
+        || ($k =~ /[:\0\n]/)
+        || ($v =~ /[\0\n]/))
+    {
+      close OUT;
+      die "IPC::DirQueue: invalid metadatum: '$k'"; # TODO: clean up files?
+    }
     print OUT $k, ": ", $v, "\n";
   }
 
@@ -964,11 +1068,13 @@ sub worker_still_working {
   my $wpid = <IN>; chomp $wpid;
   close IN;
   if ($hname eq $self->gethostname()) {
-    if (kill (0, $wpid)) {
-      return 1;         # pid is local, and still running.
+    if (!kill (0, $wpid)) {
+      return;           # pid is local and no longer running
     }
   }
-  return;               # pid is no longer running, or remote
+
+  # pid is still running, or remote
+  return 1;
 }
 
 ###########################################################################
@@ -988,7 +1094,7 @@ sub new_q_filename {
 
   my @gmt = gmtime ($job->{time_submitted_secs});
 
-  # NN20040718140300MMMM.hash(hostname.$$)[.rand]
+  # NN.20040718140300MMMM.hash(hostname.$$)[.rand]
   #
   # NN = priority, default 50
   # MMMM = microseconds from Time::HiRes::gettimeofday()
@@ -1091,15 +1197,204 @@ sub dbg {
 
 ###########################################################################
 
+sub queue_iter_start {
+  my ($self, $pathqueuedir) = @_;
+
+  if ($self->{indexclient}) {
+    dbg ("queue iter: getting list for $pathqueuedir");
+    my @files = sort grep { /^\d/ } $self->{indexclient}->ls($pathqueuedir);
+
+    if (scalar @files <= 0) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+    }
+
+    return { files => \@files };
+  }
+  elsif ($self->{ordered}) {
+    dbg ("queue iter: opening $pathqueuedir (ordered)");
+    my $files = $self->get_dir_filelist_sorted($pathqueuedir);
+    if (scalar @$files <= 0) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+    }
+
+    return { files => $files };
+  }
+  elsif ($self->{queue_fanout}) {
+    return $self->queue_iter_fanout_start($pathqueuedir);
+  }
+  else {
+    my $dirfh;
+    dbg ("queue iter: opening $pathqueuedir");
+    if (!opendir ($dirfh, $pathqueuedir)) {
+      return if $self->queuedir_is_bad($pathqueuedir);
+      if (!opendir ($dirfh, $pathqueuedir)) {
+        warn "oops? pathqueuedir bad";
+        return;
+      }
+    }
+
+    return { fh => $dirfh };
+  }
+
+  die "cannot get here";
+}
+
+sub queue_iter_next {
+  my ($self, $iter) = @_;
+
+  if ($self->{indexclient}) {
+    return shift @{$iter->{files}};
+  }
+  elsif ($self->{ordered}) {
+    return shift @{$iter->{files}};
+  }
+  elsif ($self->{queue_fanout}) {
+    return $self->queue_iter_fanout_next($iter);
+  }
+  else {
+    return readdir($iter->{fh});
+  }
+
+  return;
+}
+
+sub queue_iter_stop {
+  my ($self, $iter) = @_;
+
+  return unless $iter;
+  if (defined $iter->{fanfh}) { closedir($iter->{fanfh}); }
+  if (defined $iter->{fh}) { closedir($iter->{fh}); }
+}
+
+###########################################################################
+
+sub queue_dir_fanout_create {
+  my ($self, $pathqueuedir) = @_;
+
+  if (!$self->{queue_fanout}) {
+    return;
+  }
+
+  my @letters = split '', q{0123456789abcdef};
+  my $fanout = $letters[get_random_int() % (scalar @letters)];
+
+  $self->ensure_dir_exists ($pathqueuedir);
+  $self->ensure_dir_exists ($pathqueuedir.SLASH.$fanout);
+  return $fanout;
+}
+
+sub queue_dir_fanout_commit {
+  my ($self, $pathqueuedir, $fanout) = @_;
+
+  if (!$self->{queue_fanout}) {
+    return;
+  }
+
+  # now touch all levels ($pathqueuedir will be touched later)
+  utime(undef, undef, $pathqueuedir.SLASH.$fanout)
+      or die "cannot touch fanout for $pathqueuedir/$fanout";
+}
+
+sub queue_dir_fanout_path {
+  my ($self, $pathqueuedir, $fanout) = @_;
+
+  if (!$self->{queue_fanout}) {
+    return $pathqueuedir;
+  }
+  else {
+    return $pathqueuedir.SLASH.$fanout;
+  }
+}
+
+sub queue_dir_fanout_path_strip {
+  my ($self, $fname) = @_;
+
+  if ($self->{queue_fanout}) {
+    $fname =~ s/^.*\///;
+  }
+  return $fname;
+}
+
+sub queue_iter_fanout_start {
+  my ($self, $pathqueuedir) = @_;
+  my $iter = { };
+
+  {
+    my @fanouts;
+    dbg ("queue iter: opening $pathqueuedir");
+    if (!opendir (DIR, $pathqueuedir)) {
+      @fanouts = ();          # no dir?  nothing queued
+    }
+    else {
+      my %map = map {
+              $_ => (-M $pathqueuedir.SLASH.$_)
+            } grep { /^[a-z0-9]$/ } readdir(DIR);
+      @fanouts = sort { $map{$a} <=> $map{$b} } keys %map;
+      dbg ("fanout: $pathqueuedir, order is ".join ' ', @fanouts);
+    }
+    closedir DIR;
+    $iter->{fanoutlist} = \@fanouts;
+    $iter->{pathqueuedir} = $pathqueuedir;
+
+  }
+  return $iter;
+}
+
+sub queue_iter_fanout_next {
+  my ($self, $iter) = @_;
+
+  # dir handles are:
+  # /path/to/queue     = $iter->{fh}
+  #               /f   = $iter->{fanfh}
+
+next_fanout:
+
+  # open the {fanfh} handle, if it isn't already going
+  if (!defined $iter->{fanfh}) {
+    my $nextfanout = shift @{$iter->{fanoutlist}};
+    if (!defined $nextfanout) {
+      dbg ("fanout: end of list");
+      return;
+    }
+
+    my $dirfh;
+    dbg ("fanout: opening next dir: $nextfanout");
+    if (!opendir ($dirfh, $iter->{pathqueuedir}.SLASH.$nextfanout)) {
+      warn "opendir failed $iter->{pathqueuedir}/$nextfanout: $!";
+      return;
+    }
+
+    $iter->{fanstr} = $nextfanout;
+    $iter->{fanfh} = $dirfh;
+  }
+
+  my $fname = readdir($iter->{fanfh});
+  if (defined $fname) {
+    return $iter->{fanstr}.SLASH.$fname;        # best-case scenario
+  }
+  
+  dbg ("fanout: finished this dir, trying next one");
+  closedir($iter->{fanfh});
+  $iter->{fanstr} = undef;
+  $iter->{fanfh} = undef;
+  goto next_fanout;
+}
+
+###########################################################################
+
 1;
 
 =back
 
 =head1 STALE LOCKS AND SIGNAL HANDLING
 
-If interrupted or terminated, dequeueing processes should be careful to
-either call C<$job-E<gt>finish()> or C<$job-E<gt>return_to_queue()> on any active
+If interrupted or terminated, dequeueing processes should be careful to either
+call C<$job-E<gt>finish()> or C<$job-E<gt>return_to_queue()> on any active
 tasks before exiting -- otherwise those jobs will remain marked I<active>.
+
+Dequeueing processes can also call C<$job-E<gt>touch_active_lock()>
+periodically, while processing large tasks, to ensure that the task is still
+marked as I<active>.
 
 Stale locks are normally dealt with automatically.  If a lock is still
 I<active> after about 10 minutes of inactivity, the other dequeuers on
@@ -1109,9 +1404,13 @@ likely to be stale. If a given timeout (10 minutes plus a random value
 between 0 and 256 seconds) has elapsed since the lock file was last
 modified, the lock file is deleted.
 
+This 10-minute default can be modified using the C<active_file_lifetime>
+parameter to the C<IPC::DirQueue> constructor.
+
 Note: this means that if the dequeueing processes are spread among
 multiple machines, and there is no longer a dequeuer running on the
-machine that initially 'locked' the task, it will never be unlocked.
+machine that initially 'locked' the task, it will never be unlocked,
+unless you delete the I<active> file for that task.
 
 =head1 QUEUE DIRECTORY STRUCTURE
 
@@ -1122,8 +1421,8 @@ C<IPC::DirQueue> maintains the following structure for a queue directory:
 =item queue directory
 
 The B<queue> directory is used to store the queue control files.  Queue
-control files determine what jobs are active; if a job has a queue
-control file in this directory, it is active.
+control files determine what jobs are in the queue; if a job has a queue
+control file in this directory, it is listed in the queue.
 
 The filename format is as follows:
 
@@ -1141,6 +1440,19 @@ and further randomness will be added at the end of the string (namely, the
 current process ID and a random integer value).   Multiple retries are
 attempted until the file is atomically moved into the B<queue> directory
 without collision.
+
+If B<queue_fanout> was used in the C<IPC::DirQueue> constructor, then
+the B<queue> directory does not contain the queue control files directly;
+instead, there is an interposing set of 16 'fanout' directories, named
+according to the hex digits from C<0> to C<f>.
+
+=item active directory
+
+The B<active> directory is used to store active queue control files.
+
+When a job becomes 'active' -- ie. is picked up by C<pickup_queued_job()> --
+its control file is moved from the B<queue> directory into the B<active>
+directory while it is processed.
 
 =item data directory
 

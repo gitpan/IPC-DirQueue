@@ -31,7 +31,7 @@ start_writer();
 for my $i (0 .. 60) {
   sleep 1;
   my $count = (-s "log/counter");
-  if ($count == 100) {
+  if ($count && $count >= 100) {
     last;
   }
   print "count: $count\n";

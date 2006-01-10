@@ -1,4 +1,84 @@
 ------------------------------------------------------------------------
+r2354 | jmason | 2006-01-02 18:07:51 -0800 (Mon, 02 Jan 2006) | 1 line
+
+make the 600-second active-lock timeout configurable; document it better; and reconcile code behaviour with what the documentation says it does re behaviour when a stale lock occurs on a task supposedly active on a remote system (doco wins)
+------------------------------------------------------------------------
+r2353 | jmason | 2006-01-02 17:38:35 -0800 (Mon, 02 Jan 2006) | 1 line
+
+patch from Anton Berezin <tobez.at.tobez.org>: return reference of sorted files list internally, and use built-in sort instead of a { $a cmp $b } callback.  Both are good for speed of ordered dequeuing
+------------------------------------------------------------------------
+r2303 | jmason | 2005-12-08 17:32:51 -0800 (Thu, 08 Dec 2005) | 1 line
+
+rename test
+------------------------------------------------------------------------
+r2301 | jmason | 2005-12-08 17:31:15 -0800 (Thu, 08 Dec 2005) | 1 line
+
+back_compat_0_05 setting not necessary; removed
+------------------------------------------------------------------------
+r2300 | jmason | 2005-12-08 17:30:43 -0800 (Thu, 08 Dec 2005) | 1 line
+
+add 'dq-indexd', an index daemon for use on heavily congested NFS networks, to offload indexing tasks away from NFS
+------------------------------------------------------------------------
+r2299 | jmason | 2005-12-08 17:25:03 -0800 (Thu, 08 Dec 2005) | 1 line
+
+increase timeouts so tests still work across very slow NFS links
+------------------------------------------------------------------------
+r2295 | jmason | 2005-12-02 17:50:42 -0800 (Fri, 02 Dec 2005) | 1 line
+
+add dq-indexd, an optional, experimental central server to maintain DQ indexes, instead of using readdir() filesystem APIs; fix race condition in wait_for_queued_job() that can result in missing jobs enqueued inside the same 1-second window; add code to test scripts to ensure that queue directories are empty at end-of-test, which is how this bug was caught
+------------------------------------------------------------------------
+r2294 | jmason | 2005-12-01 17:26:52 -0800 (Thu, 01 Dec 2005) | 1 line
+
+refactor queue-fanout code out of the mainline a little more cleanly
+------------------------------------------------------------------------
+r2293 | jmason | 2005-12-01 16:16:43 -0800 (Thu, 01 Dec 2005) | 1 line
+
+remove 'lastenq' flag file; turns out it's entirely unnecessary to maintain a separate file for the purpose, when the 'queue' directory itself works just as well, and will be in the buffer cache already
+------------------------------------------------------------------------
+r2290 | jmason | 2005-11-29 19:42:19 -0800 (Tue, 29 Nov 2005) | 1 line
+
+add tests
+------------------------------------------------------------------------
+r2289 | jmason | 2005-11-29 19:24:07 -0800 (Tue, 29 Nov 2005) | 1 line
+
+add 'queue_fanout' option, to work around NFS scalability issues with massive queue directories
+------------------------------------------------------------------------
+r2285 | jmason | 2005-11-28 13:32:53 -0800 (Mon, 28 Nov 2005) | 1 line
+
+add test scripts for that bug - namely ordering issues when starting from a fresh slate
+------------------------------------------------------------------------
+r2284 | jmason | 2005-11-28 11:44:47 -0800 (Mon, 28 Nov 2005) | 1 line
+
+bug in lastenq flag-file usage; the flag file may not exist, even if the clients support it, if the queue dir has not been enqueued-to yet
+------------------------------------------------------------------------
+r2259 | jmason | 2005-11-23 16:25:26 -0800 (Wed, 23 Nov 2005) | 1 line
+
+add test script for enqueue_fh()
+------------------------------------------------------------------------
+r2258 | jmason | 2005-11-23 16:23:32 -0800 (Wed, 23 Nov 2005) | 1 line
+
+API CHANGE: invalid metadata now causes die() to be called, instead of silent ignore.  also note that enqueue_fh() closes the FH
+------------------------------------------------------------------------
+r2257 | jmason | 2005-11-22 18:58:38 -0800 (Tue, 22 Nov 2005) | 1 line
+
+fixed a long-running bug; left-over control files in 'active'.   Turns out these were a side effect of qproc A completing a task before qproc B even started creating a lockfile; in that case, qproc B would get a lock on the now-complete task, then find that the queue control file was nonexistent and give up, attempting to remove the 'active' file, but instead unlinking the now-already-unlinked temporary filename, and leaving the real 'active' file behind.  Totally harmless, fixed anyway.
+------------------------------------------------------------------------
+r2256 | jmason | 2005-11-22 13:43:21 -0800 (Tue, 22 Nov 2005) | 1 line
+
+avoid silly misleading test failures caused by accidental sharing of DQ dirs, by removing the test-suite output dir at the start of each run
+------------------------------------------------------------------------
+r2255 | jmason | 2005-11-22 13:41:14 -0800 (Tue, 22 Nov 2005) | 1 line
+
+add flags file dir, and lastenq flags file, to support Reiserfs DQ dirs, which do not update directory mtimes when a file is creating within them.  Also rename enqueue_backend() to _enqueue_backend(), to emphasise its private API nature; and a couple of minor code readability improvements
+------------------------------------------------------------------------
+r2161 | jmason | 2005-10-21 15:25:26 -0700 (Fri, 21 Oct 2005) | 1 line
+
+explain what the 'active' dir is for; possible workaround for the lidnr errors, with more data-ful messages for working out what's going on
+------------------------------------------------------------------------
+r1014 | jmason | 2005-04-22 13:24:44 -0700 (Fri, 22 Apr 2005) | 1 line
+
+0.05 RELEASED
+------------------------------------------------------------------------
 r929 | jmason | 2005-03-15 15:12:28 -0800 (Tue, 15 Mar 2005) | 1 line
 
 more paranoid link_into_dir_no_retry implementation, hopefully will fix a bug that leaves tmp active files lying around
