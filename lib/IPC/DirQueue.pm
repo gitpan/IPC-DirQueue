@@ -68,10 +68,11 @@ use Errno qw(EEXIST);
 
 our @ISA = ();
 
-our $VERSION = 0.08;
+our $VERSION = 0.09;
 
 use constant SLASH => '/';
 
+# our $DEBUG = 1;
 our $DEBUG; # = 1;
 
 ###########################################################################
@@ -179,6 +180,10 @@ sub dbg;
 Enqueue a new job for processing. Returns C<1> if the job was enqueued, or
 C<undef> on failure.
 
+C<$filename> is the path to the file to be enqueued.  Its contents
+will be read, and will be used as the contents of the data file available
+to dequeuers using C<IPC::DirQueue::Job::get_data_path()>.
+
 C<$metadata> is an optional hash reference; every item of metadata will be
 available to worker processes on the C<IPC::DirQueue::Job> object, in the
 C<$job-E<gt>{metadata}> hashref.  Note that using this channel for metadata
@@ -224,9 +229,12 @@ sub enqueue_file {
 
 Enqueue a new job for processing. Returns C<1> if the job was enqueued, or
 C<undef> on failure. C<$pri> and C<$metadata> are as described in
-C<$dq-E<gt>enqueue_file()>.  C<$filehandle> is a perl file handle
-that must be open for reading.  It will be closed on completion,
-regardless of success or failure.
+C<$dq-E<gt>enqueue_file()>.
+
+C<$filehandle> is a perl file handle that must be open for reading.  It will be
+closed on completion, regardless of success or failure. Its contents will be
+read, and will be used as the contents of the data file available to dequeuers
+using C<IPC::DirQueue::Job::get_data_path()>.
 
 =cut
 
@@ -420,7 +428,7 @@ failure:
 
 ###########################################################################
 
-=item $job = $dq->pickup_queued_job();
+=item $job = $dq->pickup_queued_job( [ path => $path ] );
 
 Pick up the next job in the queue, so that it can be processed.
 
@@ -432,10 +440,16 @@ is returned.
 Note that the job is marked as I<active> until C<$job-E<gt>finish()>
 is called.
 
+If the (optional) parameter C<path> is used, its value indicates the path of
+the desired job's data file. By using this, it is possible to cancel
+not-yet-active items from anywhere in the queue, or pick up jobs out of
+sequence.  The data path must match the value of the I<pathqueue> member of the
+C<IPC::DirQueue::Job> object returned from C<visit_all_jobs()>.
+
 =cut
 
 sub pickup_queued_job {
-  my ($self) = @_;
+  my ($self, %args) = @_;
 
   my $pathqueuedir = $self->q_subdir('queue');
   my $pathactivedir = $self->q_subdir('active');
@@ -455,6 +469,9 @@ sub pickup_queued_job {
 
     next if ($nextfilebase !~ /^\d/);
     my $pathactive = $pathactivedir.SLASH.$nextfilebase;
+    my $pathqueue  = $pathqueuedir.SLASH.$nextfile;
+
+    next if (exists($args{path}) && ($pathqueue ne $args{path}));
 
     my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
         $atime,$mtime,$ctime,$blksize,$blocks) = lstat($pathactive);
@@ -526,8 +543,6 @@ sub pickup_queued_job {
     }
     print LOCK $self->gethostname(), "\n", $$, "\n";
     close LOCK;
-
-    my $pathqueue = $pathqueuedir.SLASH.$nextfile;
 
     if (!-f $pathqueue) {
       # queue file already gone; another worker got it before we did.
@@ -1023,15 +1038,10 @@ sub create_control_file {
 }
 
 sub read_control_file {
-  my ($self, $job) = @_;
+  my ($self, $job, $infh) = @_;
   local ($_);
 
-  if (!open (IN, "<".$job->{pathqueue})) {
-    warn "IPC::DirQueue: cannot open $job->{pathqueue} for read: $!";
-    return;
-  }
-
-  while (<IN>) {
+  while (<$infh>) {
     my ($k, $value) = split (/: /, $_, 2);
     chop $value;
     if ($k =~ /^Q[A-Z]{3}$/) {
@@ -1041,7 +1051,6 @@ sub read_control_file {
       $job->{metadata}->{$k} = $value;
     }
   }
-  close IN;
 
   # all jobs must have a datafile (even if it's empty)
   if (!$job->{QDFN} || !-f $job->{QDFN}) {
