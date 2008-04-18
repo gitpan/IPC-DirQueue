@@ -68,7 +68,7 @@ use Errno qw(EEXIST);
 
 our @ISA = ();
 
-our $VERSION = 0.09;
+our $VERSION = "1.0";
 
 use constant SLASH => '/';
 
@@ -193,11 +193,11 @@ brings with it several restrictions:
 
 =item 1. it requires that the metadata be stored as 'name' => 'value' string pairs
 
-=item 2. neither 'name' nor 'value' may contain newline (\r) or NUL (\0) characters
+=item 2. neither 'name' nor 'value' may contain newline (\n) or NUL (\0) characters
 
-=item 3. 'name' cannot contain colon characters
+=item 3. 'name' cannot contain colon (:) characters
 
-=item 4. 'name' cannot start with a capital 'Q' and be 4 characters in length
+=item 4. 'name' cannot start with a capital letter 'Q' and be 4 characters in length
 
 =back
 
@@ -443,8 +443,8 @@ is called.
 If the (optional) parameter C<path> is used, its value indicates the path of
 the desired job's data file. By using this, it is possible to cancel
 not-yet-active items from anywhere in the queue, or pick up jobs out of
-sequence.  The data path must match the value of the I<pathqueue> member of the
-C<IPC::DirQueue::Job> object returned from C<visit_all_jobs()>.
+sequence.  The data path must match the value of the I<pathqueue> member of
+the C<IPC::DirQueue::Job> object passed to the C<visit_all_jobs()> callback.
 
 =cut
 
@@ -716,7 +716,7 @@ sub wait_for_queued_job {
 
 ###########################################################################
 
-=item $job = $dq->visit_all_jobs($visitor, $visitcontext);
+=item $dq->visit_all_jobs($visitor, $visitcontext);
 
 Visit all the jobs in the queue, in a read-only mode.  Used to list
 the entire queue.
@@ -797,6 +797,7 @@ sub visit_all_jobs {
   }
 
   $self->queue_iter_stop($iter);
+  return;
 }
 
 ###########################################################################
@@ -865,7 +866,8 @@ sub copy_in_to_out_fh {
 
       $len = length ($stringin);
       next if ($len == 0);  # empty string, nothing to write
-      if (!syswrite ($fhout, $stringin, $len)) {
+
+      if (!print $fhout $stringin) {
         warn "IPC::DirQueue: enqueue: cannot write to $outfname: $!";
         close $fhout;
         return;
@@ -876,7 +878,7 @@ sub copy_in_to_out_fh {
   else {
     binmode $fhin;
     while (($len = read ($fhin, $buf, $self->{buf_size})) > 0) {
-      if (!syswrite ($fhout, $buf, $len)) {
+      if (!print $fhout $buf) {
         warn "IPC::DirQueue: cannot write to $outfname: $!";
         close $fhin; close $fhout;
         return;
@@ -1020,8 +1022,8 @@ sub create_control_file {
   foreach my $k (keys %{$md}) {
     my $v = $md->{$k};
     if (($k =~ /^Q...$/)
-        || ($k =~ /[:\0\n]/)
-        || ($v =~ /[\0\n]/))
+        || ($k =~ /[:\0\n]/s)
+        || ($v =~ /[\0\n]/s))
     {
       close OUT;
       die "IPC::DirQueue: invalid metadatum: '$k'"; # TODO: clean up files?
@@ -1066,7 +1068,7 @@ sub read_control_file {
 }
 
 sub worker_still_working {
-  my ($self, $fname);
+  my ($self, $fname) = @_;
   if (!$fname) {
     return;
   }
